@@ -1,0 +1,76 @@
+# Voice Authentication Stack
+services:
+  # PostgreSQL with pgvector for voiceprint embedding storage
+  voice-auth-db:
+    image: pgvector/pgvector:pg16
+    container_name: voice-auth-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: voiceauth
+      POSTGRES_PASSWORD: ${VOICEAUTH_DB_PASSWORD:?set VOICEAUTH_DB_PASSWORD}
+      POSTGRES_DB: voiceauth
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - voice-auth-db-data:/var/lib/postgresql/data
+      - ./alembic/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voiceauth -d voiceauth"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # SpeechBrain ECAPA-TDNN speaker verification service
+  voice-auth:
+    build:
+      context: ./services/voice-auth
+      dockerfile: Dockerfile
+    container_name: voice-auth-service
+    restart: unless-stopped
+    depends_on:
+      voice-auth-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://voiceauth:${VOICEAUTH_DB_PASSWORD:?set VOICEAUTH_DB_PASSWORD}@voice-auth-db:5432/voiceauth"
+      DEVICE: "cpu"
+      THRESHOLD: "0.25"
+      MIN_AUDIO_DURATION_SEC: "5"
+      MAX_AUDIO_DURATION_SEC: "120"
+      AUTH_API_KEY: "${VOICEAUTH_API_KEY:?set VOICEAUTH_API_KEY}"
+    ports:
+      - "127.0.0.1:8011:8001"
+    volumes:
+      - ./models:/app/models
+      - voice-auth-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # AASIST anti-spoofing service (voice clone / replay detection)
+  anti-spoof:
+    build:
+      context: ./services/anti-spoof
+      dockerfile: Dockerfile
+    container_name: anti-spoof-service
+    restart: unless-stopped
+    environment:
+      DEVICE: "cpu"
+      AUTH_API_KEY: "${VOICEAUTH_API_KEY:?set VOICEAUTH_API_KEY}"
+    ports:
+      - "127.0.0.1:8012:8002"
+    volumes:
+      - anti-spoof-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+volumes:
+  voice-auth-db-data:
+  voice-auth-cache:
+  anti-spoof-cache:

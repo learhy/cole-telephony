@@ -1,0 +1,41 @@
+# Secrets & credentials — NEVER commit
+*.env
+.env.*
+!.env.example
+*_credentials*
+*token*
+
+# Live config with real API keys (example is committed instead)
+livekit-config.yaml
+
+# Biometric data — NEVER commit
+*.wav
+*.pcm
+*.mp3
+*.flac
+voiceprints/
+models/
+
+# Runtime data (PII: call content, phone numbers)
+gateway.db
+*.db
+*.sqlite
+transcripts/
+auth-audit.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Backups & scratch
+*.bak*
+*.orig
+*.tmp
+*.patch
+*.bundle
+
+# OS
+.DS_Store

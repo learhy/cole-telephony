@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# call-dan — place a voice call TO Dan's cell as "Cole" — default caller ID
+# is the toll-free line (COLE_NUMBER_TF; it also does SMS once TFV approves).
+# --from <COLE_NUMBER_360> overrides to the 360 line.
+# When Dan answers, the call is bridged into the Cole LiveKit voice agent.
+#
+# Usage: call-dan [--limit SECONDS] [--no-wait] [--from +1XXXXXXXXXX]
+#
+# How it works (2026-10-23, verified live):
+#   LiveKit Cloud dials Dan's cell through an outbound SIP trunk into a
+#   Twilio Elastic SIP Trunk (termination). PSTN leg caller ID shown to
+#   Dan = the Twilio +1 360 number. The room cole-call-<timestamp> is
+#   created; the cole-voice-agent worker auto-joins new rooms, so when Dan
+#   picks up he is talking to Cole.
+#
+#   LiveKit side: outbound trunk COLE_OUT_TRUNK_360 / COLE_OUT_TRUNK_TF
+#     ("Twilio Termination (Cole bridge)" -> <termination>.pstn.twilio.com,
+#     credential-list auth).
+#
+#   NOTE: the originally-planned architecture (Twilio REST + TwiML
+#   <Dial><Sip> into LiveKit Cloud) was built first and fails: LiveKit
+#   Cloud's SIP edge returns "404 No trunk found" for BYOT inbound trunks
+#   on this project (tried plain/E.164 + no-plus To formats, and an
+#   auth'd trunk; trunk + number verified byte-exact via API). Details in
+#   ~/cole-agent/SETUP.md. The outbound architecture achieves the same
+#   result and is verified end to end.
+#
+# Requirements: lk CLI, ~/.hermes/.env with LIVEKIT_URL, LIVEKIT_API_KEY,
+#   LIVEKIT_API_SECRET, COLE_OWNER_PHONE, COLE_NUMBER_360, COLE_NUMBER_TF,
+#   COLE_OUT_TRUNK_360 and COLE_OUT_TRUNK_TF. No numbers or trunk IDs in code.
+# Secrets are never printed. Exit codes:
+#   0  call placed and answered (SIP participant in the room)
+#   2  usage error
+#   3  missing environment/config
+#   4  LiveKit rejected the SIP participant create
+#   5  call placed but not answered within the wait window
+
+set -euo pipefail
+
+LIVEKIT_ENV="$HOME/.hermes/.env"
+DEFAULT_LIMIT=120
+WAIT_SECS=45
+
+LIMIT="$DEFAULT_LIMIT"
+NOWAIT=0
+FROM_NUMBER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --limit) LIMIT="${2:?--limit needs a value}"; shift 2 ;;
+    --no-wait) NOWAIT=1; shift ;;
+    --from) FROM_NUMBER="${2:?--from needs a number}"; shift 2 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    *) echo "call-dan: unknown arg: $1 (try --help)" >&2; exit 2 ;;
+  esac
+done
+[[ -f "$LIVEKIT_ENV" ]] || { echo "call-dan: missing $LIVEKIT_ENV (LiveKit credentials)" >&2; exit 3; }
+command -v lk >/dev/null || { echo "call-dan: lk CLI not found in PATH" >&2; exit 3; }
+
+set -a
+# ~/.hermes/.env may contain non-shell lines; export only the vars we need.
+while IFS='=' read -r k v; do
+  case "$k" in
+    LIVEKIT_URL|LIVEKIT_API_KEY|LIVEKIT_API_SECRET|COLE_OWNER_PHONE|COLE_NUMBER_360|COLE_NUMBER_TF|COLE_OUT_TRUNK_360|COLE_OUT_TRUNK_TF) export "$k=$v" ;;
+  esac
+done < "$LIVEKIT_ENV"
+set +a
+: "${LIVEKIT_URL:?call-dan: LIVEKIT_URL not set in $LIVEKIT_ENV}"
+: "${LIVEKIT_API_KEY:?call-dan: LIVEKIT_API_KEY not set in $LIVEKIT_ENV}"
+: "${LIVEKIT_API_SECRET:?call-dan: LIVEKIT_API_SECRET not set in $LIVEKIT_ENV}"
+for v in COLE_OWNER_PHONE COLE_NUMBER_360 COLE_NUMBER_TF COLE_OUT_TRUNK_360 COLE_OUT_TRUNK_TF; do
+  [[ -n "${!v:-}" ]] || { echo "call-dan: $v not set in $LIVEKIT_ENV" >&2; exit 3; }
+done
+TO_NUMBER="$COLE_OWNER_PHONE"
+FROM_NUMBER="${FROM_NUMBER:-$COLE_NUMBER_TF}"
+[[ "$FROM_NUMBER" =~ ^\+1[0-9]{10}$ ]] || { echo "call-dan: --from must be E.164 (+1XXXXXXXXXX)" >&2; exit 2; }
+if [[ "$FROM_NUMBER" == "$COLE_NUMBER_TF" ]]; then OUT_TRUNK="$COLE_OUT_TRUNK_TF"
+elif [[ "$FROM_NUMBER" == "$COLE_NUMBER_360" ]]; then OUT_TRUNK="$COLE_OUT_TRUNK_360"
+else echo "call-dan: --from number not owned by this service: $FROM_NUMBER" >&2; exit 2; fi
+
+ROOM="cole-call-$(date +%s)"
+IDENT="dan-$(date +%s)"
+
+
+RESP=$(lk sip participant create \
+  --room "$ROOM" \
+  --trunk "$OUT_TRUNK" \
+  --number "$FROM_NUMBER" \
+  --call "$TO_NUMBER" \
+  --identity "$IDENT" 2>&1) || {
+  echo "call-dan: LiveKit rejected the call: $RESP" >&2
+  exit 4
+}
+
+SCL=$(printf '%s' "$RESP" | grep -oP 'SIPCallID: \K\S+' || true)
+echo "call-dan: call placed room=$ROOM sip_call_id=${SCL:-unknown} to=$TO_NUMBER limit=${LIMIT}s"
+
+# Hard cap: tear the room down after LIMIT seconds regardless of call state.
+( sleep "$LIMIT"; lk room delete "$ROOM" >/dev/null 2>&1 ) >/dev/null 2>&1 &
+disown
+
+[[ "$NOWAIT" == "1" ]] && exit 0
+
+# Poll: the SIP participant only joins the room once Dan answers.
+ANSWERED=0
+for i in $(seq 1 $(( WAIT_SECS / 5 ))); do
+  sleep 5
+  LINE=$(lk list-rooms 2>/dev/null | grep "$ROOM" || true)
+  NPART=$(printf '%s' "$LINE" | grep -oP '│ \K[0-9]+(?= +│ +[0-9]+ +│)' || true)
+  # participants column is the second numeric column; simpler: check >= 2 pipes of numbers
+  if printf '%s' "$LINE" | grep -oP '[0-9]+' | tail -2 | head -1 | grep -q '^2$'; then
+    ANSWERED=1
+    break
+  fi
+  # fallback: any 2+ participants reported
+  if printf '%s' "$LINE" | grep -qP '│ 2 +│'; then ANSWERED=1; break; fi
+done
+
+if [[ "$ANSWERED" == "1" ]]; then
+  echo "call-dan: status=answered (SIP participant + agent live in $ROOM; auto-ends at ${LIMIT}s)"
+  exit 0
+fi
+
+echo "call-dan: no answer within ~${WAIT_SECS}s (may still be ringing; room=$ROOM)" >&2
+exit 5

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# text-dan — page Dan (the user) from any agent or cron on this host.
+# Usage: text-dan "message text"
+# PRIMARY PATH (2026-10-06, Dan's call): Telegram via the work-assistant
+#   gateway bot (creds in ~/.hermes/profiles/work-assistant/.env) — proven
+#   delivering (messages 5315-5317).
+# OPTIONAL PATH: Twilio SMS via ~/software/audioqa/.env — deprioritized by
+#   Dan until the A2P campaign exists (carrier 30034). Use
+#   TEXT_DAN_FORCE=sms to attempt it; a sid only means Twilio ACCEPTED it —
+#   use TEXT_DAN_VERIFY=1 to require delivered/sent.
+# Secrets are never printed. Exit 0 on send, non-zero on failure.
+
+set -euo pipefail
+
+ENV_FILE="$HOME/software/audioqa/.env"
+# Destination comes from env or ~/.hermes/.env (COLE_OWNER_PHONE), never hardcoded.
+TO_NUMBER="${COLE_OWNER_PHONE:-$(grep -oP '^COLE_OWNER_PHONE=\K\S+' "$HOME/.hermes/.env" 2>/dev/null || true)}"
+MAX_BODY=1600
+
+if [[ $# -lt 1 || -z "${1// }" ]]; then
+  echo "usage: text-dan \"message text\"" >&2
+  exit 2
+fi
+
+BODY="${1}"
+BODY="${BODY:0:$MAX_BODY}"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "text-dan: missing $ENV_FILE (Twilio credentials)" >&2
+  exit 3
+fi
+
+send_telegram() {
+  local msg="$1"
+  local tg_env="$HOME/.hermes/profiles/work-assistant/.env"
+  [[ -f "$tg_env" ]] || { echo "text-dan: telegram fallback: missing $tg_env" >&2; return 3; }
+  local tok chat
+  tok=$(grep -oP '^TELEGRAM_BOT_TOKEN=\K\S+' "$tg_env") || return 3
+  chat=$(grep -oP '^TELEGRAM_HOME_CHANNEL=\K\S+' "$tg_env") || return 3
+  [[ -n "$tok" && -n "$chat" ]] || { echo "text-dan: telegram fallback: creds missing in $tg_env" >&2; return 3; }
+  local resp
+  resp=$(curl -sS -X POST "https://api.telegram.org/bot${tok}/sendMessage" \
+    --data-urlencode "chat_id=$chat" \
+    --data-urlencode "text=$msg") || { echo "text-dan: telegram send failed (network)" >&2; return 4; }
+  if printf '%s' "$resp" | grep -q '"ok":true'; then
+    echo "text-dan: telegram fallback sent (msg $(printf '%s' "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["message_id"])' 2>/dev/null || true))"
+    return 0
+  fi
+  echo "text-dan: telegram send rejected: $(printf '%s' "$resp" | head -c 200)" >&2
+  return 4
+}
+
+if [[ "${TEXT_DAN_FORCE:-}" == "sms" ]]; then
+  : # fall through to the Twilio path below
+else
+  # Default: Telegram (Dan's chosen channel, 2026-10-06).
+  send_telegram "${0##*/}: $BODY"
+  exit $?
+fi
+
+# Source only the Twilio vars we need (avoids clobbering unrelated env)
+set -a
+source "$ENV_FILE"
+set +a
+
+: "${TWILIO_ACCOUNT_SID:?text-dan: TWILIO_ACCOUNT_SID not set in $ENV_FILE}"
+: "${TWILIO_AUTH_TOKEN:?text-dan: TWILIO_AUTH_TOKEN not set in $ENV_FILE}"
+: "${TWILIO_MESSAGING_SERVICE_SID:?text-dan: TWILIO_MESSAGING_SERVICE_SID not set in $ENV_FILE}"
+: "${TO_NUMBER:?text-dan: COLE_OWNER_PHONE not set (env or ~/.hermes/.env)}"
+
+RESP=$(curl -sS -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
+  --data-urlencode "To=$TO_NUMBER" \
+  --data-urlencode "MessagingServiceSid=$TWILIO_MESSAGING_SERVICE_SID" \
+  --data-urlencode "Body=$BODY" \
+  "https://api.twilio.com/2010-04-01/Accounts/$TWILIO_ACCOUNT_SID/Messages.json")
+
+SID=$(printf '%s' "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("sid",""))' 2>/dev/null || true)
+ERRCODE=$(printf '%s' "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("code",""))' 2>/dev/null || true)
+ERRMSG=$(printf '%s' "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("message",""))' 2>/dev/null || true)
+
+if [[ -n "$SID" && "$SID" == SM* ]]; then
+  echo "text-dan: accepted sid=$SID"
+  if [[ "${TEXT_DAN_VERIFY:-0}" == "1" ]]; then
+    # Poll up to ~30s for delivered/sent; report final state either way.
+    for i in $(seq 1 10); do
+      sleep 3
+      ST=$(curl -sS -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
+        "https://api.twilio.com/2010-04-01/Accounts/$TWILIO_ACCOUNT_SID/Messages/$SID.json" \
+        | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("status",""), d.get("error_code",""))' 2>/dev/null || true)
+      STATUS=$(printf '%s' "$ST" | cut -d' ' -f1)
+      ECODE=$(printf '%s' "$ST" | cut -d' ' -f2)
+      case "$STATUS" in
+        delivered|sent)
+          echo "text-dan: final status=$STATUS"; exit 0 ;;
+        undelivered|failed)
+          echo "text-dan: final status=$STATUS error_code=$ECODE (carrier-level failure)" >&2
+          if send_telegram "${0##*/} (SMS undelivered, $STATUS/$ECODE): $BODY"; then
+            exit 0
+          fi
+          exit 5 ;;
+      esac
+    done
+    echo "text-dan: still status=$STATUS after ~30s (may still deliver)"; exit 0
+  fi
+  exit 0
+fi
+
+# No sid — Twilio rejected the call.
+echo "text-dan: send failed code=$ERRCODE msg=$ERRMSG" >&2
+if send_telegram "${0##*/} (SMS rejected, code $ERRCODE): $BODY"; then
+  exit 0
+fi
+exit 4

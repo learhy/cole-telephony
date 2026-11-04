@@ -1,0 +1,9 @@
+torch==2.13.0
+torchaudio==2.11.0
+fastapi==0.133.1
+uvicorn==0.41.0
+python-multipart>=0.0.20
+numpy>=2.0
+soundfile==0.14.0
+librosa>=0.10.0
+scipy

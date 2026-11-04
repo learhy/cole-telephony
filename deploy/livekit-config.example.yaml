@@ -1,0 +1,35 @@
+# LiveKit Server Configuration (SANITIZED EXAMPLE)
+# The live config at ~/livekit-config.yaml contains real API keys and is
+# gitignored. Copy this file, then fill in your own key:secret pair.
+# https://docs.livekit.io/home/server/config/
+
+bind_addresses:
+  - "0.0.0.0"
+
+# API keys — format is "key: secret" (newline-separated for multiple).
+# Generate with: lk server create-key  (or via LiveKit Cloud dashboard)
+keys:
+  YOUR_API_KEY: YOUR_API_SECRET
+
+# Redis for SIP/state management
+redis:
+  address: "127.0.0.1:6379"
+
+# WebRTC settings
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 60000
+  use_external_ip: true
+
+# TURN for NAT traversal
+turn:
+  tls_port: 5349
+  udp_port: 3478
+
+room:
+  auto_create: true
+  empty_timeout: 300
+
+logging:
+  level: info
